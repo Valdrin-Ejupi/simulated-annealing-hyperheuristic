@@ -15,10 +15,16 @@ from functools import partial
 import multiprocessing
 from typing import Tuple
 from models.instance_data import InstanceData
+#Stimulaited Annealing Cooling Functions
+def cooling_exponential(temp, cooling_rate=0.003):
+    return temp * (1 - cooling_rate)
+def cooling_geometric(temp, alpha=0.95):
+    return temp * alpha
+def cooling_lundy_mees(temp, beta=0.001):
+    return temp / (1 + beta * temp)
 class Solver:
     def __init__(self):
         pass
-    
     def generate_initial_solution(self, data):
         Library._id_counter = 0
         
@@ -830,3 +836,280 @@ class Solver:
         new_solution.calculate_fitness_score(data.scores)
         
         return new_solution
+    def simulated_annealing_core_mp_optimized(self, initial_solution, data, cooling_func, iterations, shared_best, lock, name):
+        current_solution = copy.deepcopy(initial_solution)
+        current_solution.calculate_fitness_score(data.scores)
+        best_solution = copy.deepcopy(current_solution)
+        current_temp = 1000.0
+        start_time = time.time()  # Koha e fillimit për kontrollin 10 minutësh
+
+        # Operatorët kryesorë
+        operators = [
+            self.tweak_solution_swap_signed,
+            self.tweak_solution_swap_signed_with_unsigned,
+            self.tweak_solution_swap_same_books,
+            self.tweak_solution_swap_last_book,
+            self.tweak_solution_insert_library,
+            self.tweak_solution_swap_neighbor_libraries
+        ]
+        operator_names = [
+            "swap_signed",
+            "swap_signed_with_unsigned",
+            "swap_same_books",
+            "swap_last_book",
+            "insert_library",
+            "swap_neighbor"
+        ]
+
+        #Inicializo peshat për secilin operator
+        stats = {
+            name: {"gain": 1.0, "count": 1} for name in operator_names
+        }
+        weights = [1.0 for _ in operators]
+
+        for iteration in range(iterations):
+            # Kontrolli i kohës për ndalje pas 10 minutash (600 sekonda)
+            elapsed_time = time.time() - start_time
+            if elapsed_time >= 600:
+                print(f"[{name.upper()}] ⏱️ Time limit reached (10 minutes). Breaking at iteration {iteration}")
+                break
+
+            # Zgjedh operatorin sipas peshave
+            operator = random.choices(operators, weights=weights, k=1)[0]
+            op_name = operator_names[operators.index(operator)]
+
+            try:
+                new_solution = operator(copy.deepcopy(current_solution), data)
+                new_solution.calculate_fitness_score(data.scores)
+
+                delta = new_solution.fitness_score - current_solution.fitness_score
+                acceptance_prob = math.exp(delta / current_temp) if delta < 0 else 1.0
+
+                if delta > 0 or random.random() < acceptance_prob:
+                    current_solution = new_solution
+                    if current_solution.fitness_score > best_solution.fitness_score:
+                        best_solution = copy.deepcopy(current_solution)
+                    stats[op_name]["gain"] += max(0, delta)
+
+                stats[op_name]["count"] += 1
+
+            except Exception:
+                continue
+
+            # Ftohja e temperaturës
+            current_temp = cooling_func(current_temp)
+
+            # Sinkronizimi dhe përditësimi i peshave çdo 100 iterime
+            if iteration % 100 == 0:
+                with lock:
+                    if best_solution.fitness_score > shared_best["score"]:
+                        shared_best["score"] = best_solution.fitness_score
+                        shared_best["solution"] = copy.deepcopy(best_solution)
+                    else:
+                        current_solution = copy.deepcopy(shared_best["solution"])
+                        current_solution.calculate_fitness_score(data.scores)
+
+                #Përditëso peshat sipas mesatares së "gain"
+                weights = [
+                    stats[name]["gain"] / stats[name]["count"]
+                    for name in operator_names
+                ]
+        with lock:
+            if best_solution.fitness_score > shared_best["score"]:
+                shared_best["score"] = best_solution.fitness_score
+                shared_best["solution"] = best_solution
+    def simulated_annealing_hybrid_parallel(self, data, max_iterations=500,initial_solution=None):
+            #Generate initial solution using GRASP
+            if initial_solution is None:
+                initial_solution = self.generate_initial_solution_grasp(data, p=0.05, max_time=5)
+
+            # Shared dictionary and lock for process synchronization
+            manager = multiprocessing.Manager()
+            shared_best = manager.dict()
+            shared_best["score"] = initial_solution.fitness_score
+            shared_best["solution"] = initial_solution
+            lock = manager.Lock()
+
+            # Launch three paralell processes with different cooling strategies
+
+            processes = [
+                multiprocessing.Process(target=self.simulated_annealing_core_mp_optimized,
+                                        args=(initial_solution, data, cooling_exponential, max_iterations, shared_best, lock, "exp")),
+                multiprocessing.Process(target=self.simulated_annealing_core_mp_optimized,
+                                        args=(initial_solution, data, cooling_geometric, max_iterations, shared_best, lock, "geo")),
+                multiprocessing.Process(target=self.simulated_annealing_core_mp_optimized,
+                                        args=(initial_solution, data, cooling_lundy_mees, max_iterations, shared_best, lock, "lundy"))
+            ]
+
+            # Start all processes
+
+            for p in processes:
+                p.start()
+            
+            # Wait for all to finish
+
+            for p in processes:
+                p.join()
+
+            return shared_best["score"], shared_best["solution"]
+    def validate_solution(self, solution, data):
+        # Validates and corrects a solution by removing excess books from libraries that exceed scanning limits.
+        id_map = {lib.id: lib for lib in data.libs}
+        curr_time = 0
+
+        # Validate each library in the signed list
+
+        for lib_id in list(solution.signed_libraries):
+            library = id_map.get(lib_id)
+            if library is None:
+                continue  # # Skip if ID is invalid
+            
+            # Calculate how many books this library can scan within the time limit
+
+            if curr_time + library.signup_days >= data.num_days:
+                max_books = 0
+            else:
+                time_left = data.num_days - (curr_time + library.signup_days)
+                max_books = time_left * library.books_per_day
+           
+            # Get currently planned books
+            
+            scanned_list = solution.scanned_books_per_library.get(lib_id, [])
+            actual_count = len(scanned_list)
+
+            # Remove excess books if over limit
+
+            if actual_count > max_books:
+                # Remove all books
+                if max_books <= 0:
+        
+                    removed_books = set(scanned_list)
+                    solution.scanned_books_per_library.pop(lib_id, None)
+                else:
+                    # Remove lowest-scoring books
+                    sorted_books = sorted(scanned_list, key=lambda b: data.scores[b])
+                    remove_count = actual_count - max_books
+                    removed_books = set(sorted_books[:remove_count])
+                    kept_books = [b for b in scanned_list if b not in removed_books]
+                    solution.scanned_books_per_library[lib_id] = kept_books
+
+                # Remove from global scanned books
+
+                solution.scanned_books.difference_update(removed_books)
+             
+            # Advance time with registered date of this library
+            
+            curr_time += library.signup_days
+        return solution
+    # def cpp_style_improvement(self, solution, data, iterations=500):
+    #     import random
+    #     from copy import deepcopy
+
+    #     new_solution = deepcopy(solution)
+
+    #     book_used = set()
+    #     for books in new_solution.scanned_books_per_library.values():
+    #         book_used.update(books)
+
+    #     for _ in range(iterations):
+    #         if not new_solution.signed_libraries:
+    #             break
+
+    #         lib_id = random.choice(list(new_solution.signed_libraries))
+    #         books = new_solution.scanned_books_per_library.get(lib_id, [])
+    #         if not books:
+    #             continue
+
+    #         lib = data.libs[lib_id]
+    #         books_sorted = sorted(books, key=lambda b: data.scores[b])
+    #         for b_out in books_sorted:
+    #             #lib.books contains Book objects
+    #             candidates = [b for b in lib.books if b.id not in book_used]
+    #             if not candidates:
+    #                 continue
+    #             b_in = max(candidates, key=lambda b: data.scores[b.id], default=None)
+
+    #             if b_in and data.scores[b_in.id] > data.scores[b_out]:
+    #                 books.remove(b_out)
+    #                 books.append(b_in.id)
+    #                 book_used.remove(b_out)
+    #                 book_used.add(b_in.id)
+    #                 break
+
+    #         new_solution.scanned_books_per_library[lib_id] = books
+
+    #     new_solution.calculate_fitness_score(data.scores)
+    #     return new_solution
+    # def greedy_medium_approach(self, solution, data, iterations=1):
+    #     from copy import deepcopy
+    #     current_solution = deepcopy(solution)
+    #     assigned_books = set(current_solution.scanned_books)
+    #     assigned_libraries = set(current_solution.signed_libraries)
+
+    #     # Rikalkulojmë current_day bazuar në libraritë ekzistuese
+    #     id_map = {lib.id: lib for lib in data.libs}
+    #     curr_time = 0
+    #     for lib_id in current_solution.signed_libraries:
+    #         lib = id_map[lib_id]
+    #         curr_time += lib.signup_days
+    #         if curr_time >= data.num_days:
+    #             break
+
+    #     remaining_libraries = [lib for lib in data.libs if lib.id not in assigned_libraries]
+    #     selected_libraries = [
+    #         (lib_id, current_solution.scanned_books_per_library.get(lib_id, []))
+    #         for lib_id in current_solution.signed_libraries
+    #     ]
+
+    #     while curr_time < data.num_days and remaining_libraries:
+    #         best_lib = None
+    #         best_score = float('-inf')
+    #         best_books = []
+
+    #         for lib in remaining_libraries:
+    #             days_left = data.num_days - curr_time - lib.signup_days
+    #             if days_left <= 0:
+    #                 continue
+
+    #             max_books = days_left * lib.books_per_day
+    #             available_books = [b for b in lib.books if b.id not in assigned_books]
+    #             sorted_books = sorted(available_books, key=lambda b: data.scores[b.id], reverse=True)
+    #             top_books = sorted_books[:max_books]
+    #             score_sum = sum(data.scores[b.id] for b in top_books)
+
+    #             lib_score = score_sum / lib.signup_days if lib.signup_days else score_sum
+
+    #             if lib_score > best_score and top_books:
+    #                 best_score = lib_score
+    #                 best_lib = lib
+    #                 best_books = top_books
+
+    #         if not best_lib:
+    #             break
+
+    #         curr_time += best_lib.signup_days
+    #         if curr_time >= data.num_days:
+    #             break
+
+    #         # Llogarit sasinë reale të librave që mund të skanohen
+    #         days_left = data.num_days - curr_time
+    #         max_books = min(days_left * best_lib.books_per_day, len(best_books))
+    #         final_books = best_books[:max_books]
+
+    #         assigned_books.update(b.id for b in final_books)
+    #         selected_libraries.append((best_lib.id, [b.id for b in final_books]))
+    #         assigned_libraries.add(best_lib.id)
+    #         remaining_libraries = [l for l in remaining_libraries if l.id != best_lib.id]
+
+    #     # Krijimi i zgjidhjes së re
+    #     new_solution = deepcopy(current_solution)
+    #     new_solution.signed_libraries = [lib_id for lib_id, _ in selected_libraries]
+    #     new_solution.scanned_books_per_library = {lib_id: books for lib_id, books in selected_libraries}
+    #     new_solution.scanned_books = set()
+    #     for books in new_solution.scanned_books_per_library.values():
+    #         new_solution.scanned_books.update(books)
+
+    #     new_solution.calculate_fitness_score(data.scores)
+    #     self.validate_solution(new_solution, data)
+
+    #     return new_solution
