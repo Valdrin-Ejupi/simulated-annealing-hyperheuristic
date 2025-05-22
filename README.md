@@ -164,7 +164,6 @@ Upon termination:
 
 ##### Algorithmic Concepts
 - [An Introduction to a Powerful Optimization Technique: Simulated Annealing](https://medium.com/data-science/an-introduction-to-a-powerful-optimization-technique-simulated-annealing-87fd1e3676dd) – Medium
-- [Adaptive Operator Selection in Heuristics](https://hal.science/hal-00349087v2/document)
 
 ## Python Multiprocessing
 - [Python multiprocessing documentation](https://docs.python.org/3/library/multiprocessing.html)
