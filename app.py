@@ -50,8 +50,8 @@ def run_full_pipeline():
             # Metodat e disponueshme në cikël
             method_pool = [
                 solver.simulated_annealing_hybrid_parallel,
-                # solver.cpp_style_improvement,
-                # solver.greedy_medium_approach,
+                solver.cpp_style_improvement,
+                solver.greedy_medium_approach
             ]
 
             final_solution = run_hypercycle(parser, solver, method_pool, rounds=10)
@@ -59,19 +59,19 @@ def run_full_pipeline():
             output_path = os.path.join(output_dir, f'sol_{file}')
             final_solution.export(output_path)
             print(f"\n Final solution written to: {output_path}\n")
-# def run_parallel_sa():
+def run_parallel_sa():
 
-#     print("---------- SIMULATED ANNEALING WITH MULTIPLE TEMPERATURE FUNCTIONS (PARALLEL) ----------")
-#     for file in directory:
-#         if file.endswith('.txt') or file.endswith('.in'):
-#             print(f'Computing ./input/{file}')
-#             parser = Parser(f'./input/{file}')
-#             data = parser.parse()
-#             score, solution = solver.simulated_annealing_hybrid_parallel(data, max_iterations=1000)
-#             print(f'Best score from SA (parallel) for {file}: {score:,}')
-#             output_file = f'./output/sa_hybrid_parallel_{file}'
-#             solution.export(output_file)
-#             print(f"Processing complete! Output written to: {output_file}")
+    print("---------- SIMULATED ANNEALING WITH MULTIPLE TEMPERATURE FUNCTIONS (PARALLEL) ----------")
+    for file in directory:
+        if file.endswith('.txt') or file.endswith('.in'):
+            print(f'Computing ./input/{file}')
+            parser = Parser(f'./input/{file}')
+            data = parser.parse()
+            score, solution = solver.simulated_annealing_hybrid_parallel(data, max_iterations=1000)
+            print(f'Best score from SA (parallel) for {file}: {score:,}')
+            output_file = f'./output/{file.replace(".in", ".txt")}'
+            solution.export(output_file)
+            print(f"Processing complete! Output written to: {output_file}")
            
 if __name__ == "__main__":
     multiprocessing.freeze_support()

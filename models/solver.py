@@ -1,4 +1,5 @@
 import random
+import matplotlib.pyplot as plt
 from collections import defaultdict
 import threading
 import time
@@ -22,6 +23,7 @@ def cooling_geometric(temp, alpha=0.95):
     return temp * alpha
 def cooling_lundy_mees(temp, beta=0.001):
     return temp / (1 + beta * temp)
+
 class Solver:
     def __init__(self):
         pass
@@ -841,6 +843,7 @@ class Solver:
         current_solution.calculate_fitness_score(data.scores)
         best_solution = copy.deepcopy(current_solution)
         current_temp = 1000.0
+        # temp_trace = []  # Collect temperature per iteration
         start_time = time.time()  # Koha e fillimit për kontrollin 10 minutësh
 
         # Operatorët kryesorë
@@ -898,7 +901,7 @@ class Solver:
 
             # Ftohja e temperaturës
             current_temp = cooling_func(current_temp)
-
+            # temp_trace.append(current_temp)
             # Sinkronizimi dhe përditësimi i peshave çdo 100 iterime
             if iteration % 100 == 0:
                 with lock:
@@ -914,10 +917,20 @@ class Solver:
                     stats[name]["gain"] / stats[name]["count"]
                     for name in operator_names
                 ]
+             # Final validation
+        try:
+            self.validate_solution(best_solution, data)
+            best_solution.calculate_fitness_score(data.scores)
+        except:
+            print(f"[{name.upper()}] Final solution invalid.")
+            return
         with lock:
             if best_solution.fitness_score > shared_best["score"]:
                 shared_best["score"] = best_solution.fitness_score
                 shared_best["solution"] = best_solution
+            # if "temps" not in shared_best:
+            #      shared_best["temps"] = {}
+            # shared_best["temps"][name] = temp_trace  #  Save trace for plotting
     def simulated_annealing_hybrid_parallel(self, data, max_iterations=500,initial_solution=None):
             #Generate initial solution using GRASP
             if initial_solution is None:
@@ -928,6 +941,7 @@ class Solver:
             shared_best = manager.dict()
             shared_best["score"] = initial_solution.fitness_score
             shared_best["solution"] = initial_solution
+            # shared_best["temps"] = manager.dict()  #  Shared temp traces
             lock = manager.Lock()
 
             # Launch three paralell processes with different cooling strategies
@@ -951,56 +965,79 @@ class Solver:
             for p in processes:
                 p.join()
 
+            # Visualize temperature curves
+            # plt.figure(figsize=(10, 6))
+            # # for name, temps in dict(shared_best["temps"]).items():
+            # #     if temps:
+            # #         plt.plot(temps, label=name.upper())
+            # temps_dict = shared_best.get("temps", {})
+
+            # if temps_dict:
+            #     if "exp" in temps_dict:
+            #         plt.plot(temps_dict["exp"], label=r"EXP: $T = T_0 \cdot e^{-\alpha \cdot k}$")
+            #     if "geo" in temps_dict:
+            #         plt.plot(temps_dict["geo"], label=r"GEO: $T = T_0 \cdot \alpha^k$")
+            #     if "lundy" in temps_dict:
+            #         plt.plot(temps_dict["lundy"], label=r"LUNDY: $T = \frac{T}{1 + \beta \cdot T}$")
+            # plt.title("Cooling Schedule Comparison")
+            # plt.xlabel("Iteration")
+            # plt.ylabel("Temperature")
+            # plt.grid(True)
+            # plt.legend()
+            # plt.tight_layout()
+            # # plt.savefig("output/cooling_schedules_comparison.png")
+            # plt.show()
+            # plt.close()
             return shared_best["score"], shared_best["solution"]
-    def validate_solution(self, solution, data):
-        # Validates and corrects a solution by removing excess books from libraries that exceed scanning limits.
-        id_map = {lib.id: lib for lib in data.libs}
-        curr_time = 0
+    # def validate_solution(self, solution, data):
+    #     # Validates and corrects a solution by removing excess books from libraries that exceed scanning limits.
+    #     id_map = {lib.id: lib for lib in data.libs}
+    #     curr_time = 0
 
-        # Validate each library in the signed list
+    #     # Validate each library in the signed list
 
-        for lib_id in list(solution.signed_libraries):
-            library = id_map.get(lib_id)
-            if library is None:
-                continue  # # Skip if ID is invalid
+    #     for lib_id in list(solution.signed_libraries):
+    #         library = id_map.get(lib_id)
+    #         if library is None:
+    #             continue  # # Skip if ID is invalid
             
-            # Calculate how many books this library can scan within the time limit
+    #         # Calculate how many books this library can scan within the time limit
 
-            if curr_time + library.signup_days >= data.num_days:
-                max_books = 0
-            else:
-                time_left = data.num_days - (curr_time + library.signup_days)
-                max_books = time_left * library.books_per_day
+    #         if curr_time + library.signup_days >= data.num_days:
+    #             max_books = 0
+    #         else:
+    #             time_left = data.num_days - (curr_time + library.signup_days)
+    #             max_books = time_left * library.books_per_day
            
-            # Get currently planned books
+    #         # Get currently planned books
             
-            scanned_list = solution.scanned_books_per_library.get(lib_id, [])
-            actual_count = len(scanned_list)
+    #         scanned_list = solution.scanned_books_per_library.get(lib_id, [])
+    #         actual_count = len(scanned_list)
 
-            # Remove excess books if over limit
+    #         # Remove excess books if over limit
 
-            if actual_count > max_books:
-                # Remove all books
-                if max_books <= 0:
+    #         if actual_count > max_books:
+    #             # Remove all books
+    #             if max_books <= 0:
         
-                    removed_books = set(scanned_list)
-                    solution.scanned_books_per_library.pop(lib_id, None)
-                else:
-                    # Remove lowest-scoring books
-                    sorted_books = sorted(scanned_list, key=lambda b: data.scores[b])
-                    remove_count = actual_count - max_books
-                    removed_books = set(sorted_books[:remove_count])
-                    kept_books = [b for b in scanned_list if b not in removed_books]
-                    solution.scanned_books_per_library[lib_id] = kept_books
+    #                 removed_books = set(scanned_list)
+    #                 solution.scanned_books_per_library.pop(lib_id, None)
+    #             else:
+    #                 # Remove lowest-scoring books
+    #                 sorted_books = sorted(scanned_list, key=lambda b: data.scores[b])
+    #                 remove_count = actual_count - max_books
+    #                 removed_books = set(sorted_books[:remove_count])
+    #                 kept_books = [b for b in scanned_list if b not in removed_books]
+    #                 solution.scanned_books_per_library[lib_id] = kept_books
 
-                # Remove from global scanned books
+    #             # Remove from global scanned books
 
-                solution.scanned_books.difference_update(removed_books)
+    #             solution.scanned_books.difference_update(removed_books)
              
-            # Advance time with registered date of this library
+    #         # Advance time with registered date of this library
             
-            curr_time += library.signup_days
-        return solution
+    #         curr_time += library.signup_days
+    #     return solution
     # def cpp_style_improvement(self, solution, data, iterations=500):
     #     import random
     #     from copy import deepcopy

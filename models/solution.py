@@ -19,7 +19,7 @@ class Solution:
                 ofp.write(f"{library} {len(books)}\n")
                 ofp.write(" ".join(map(str, books)) + "\n")
 
-        print(f"Processing complete! Output written to: {file_path}")
+        # print(f"Processing complete! Output written to: {file_path}")
 
     def describe(self, file_path="./output/output.txt"):
         with open(file_path, "w+") as lofp:
