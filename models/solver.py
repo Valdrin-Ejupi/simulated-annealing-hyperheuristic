@@ -1,5 +1,4 @@
 import random
-import matplotlib.pyplot as plt
 from collections import defaultdict
 import threading
 import time
@@ -23,7 +22,17 @@ def cooling_geometric(temp, alpha=0.95):
     return temp * alpha
 def cooling_lundy_mees(temp, beta=0.001):
     return temp / (1 + beta * temp)
-
+def _pool_init(instance_data: InstanceData, hc_steps: int, mutation_prob: float):
+    global INSTANCE, HC_STEPS, MUT_PROB, SOLVER
+    INSTANCE    = instance_data
+    HC_STEPS    = hc_steps
+    MUT_PROB    = mutation_prob
+    SOLVER      = Solver()
+def _process_offspring(sol: Solution) -> Solution:
+    """In‐place mutation + hill‐climb on one offspring."""
+    if random.random() < MUT_PROB:
+        _, sol = SOLVER.hill_climbing_combined(INSTANCE, iterations=HC_STEPS, initial_solution=sol)
+    return sol
 class Solver:
     def __init__(self):
         pass
@@ -63,43 +72,66 @@ class Solver:
         solution.calculate_fitness_score(data.scores)
 
         return solution
+    def hill_climbing_combined(self, data, iterations=1000, initial_solution=None):
+        solution = copy.deepcopy(initial_solution) if initial_solution else self.generate_initial_solution_grasp(data)
 
+        list_of_climbs = [
+            self.tweak_solution_swap_signed_with_unsigned,
+            self.tweak_solution_swap_same_books,
+            self.tweak_solution_swap_signed,
+            self.tweak_solution_swap_last_book,
+            self.tweak_solution_swap_neighbor_libraries,
+            self.tweak_solution_insert_library,
+        ]
+
+        for i in range(iterations - 1):
+            target_climb = random.choice(list_of_climbs)
+            solution_copy = copy.deepcopy(solution)
+            new_solution = target_climb(solution_copy, data)
+
+            if new_solution and new_solution.fitness_score > solution.fitness_score:
+                solution = new_solution
+
+        return (solution.fitness_score, solution)
     def crossover(self, solution, data):
-        """Performs crossover by shuffling library order and swapping books accordingly."""
-        new_solution = copy.deepcopy(solution) 
-
-        old_order = new_solution.signed_libraries[:]
-        library_indices = list(range(len(data.libs)))
-        random.shuffle(library_indices)
-
+        """Performs crossover by shuffling library order and recalculating books."""
+        new_solution = copy.deepcopy(solution)
+        
+        # Shuffle the order of signed libraries
+        random.shuffle(new_solution.signed_libraries)
+        
+        # Recalculate everything from scratch with new order
+        curr_time = 0
+        scanned_books = set()
         new_scanned_books_per_library = {}
-
-        for new_idx, new_lib_idx in enumerate(library_indices):
-            if new_idx >= len(old_order):
-                break 
-
-            old_lib_id = old_order[new_idx]
-            new_lib_id = new_lib_idx
-
-            if new_lib_id < 0 or new_lib_id >= len(data.libs):
-                print(f"Warning: new_lib_id {new_lib_id} is out of range for data.libs (size: {len(data.libs)})")
+        
+        for lib_id in new_solution.signed_libraries:
+            if lib_id >= len(data.libs):
                 continue
-
-            if old_lib_id in new_solution.scanned_books_per_library:
-                books_to_move = new_solution.scanned_books_per_library[old_lib_id]
-
-                existing_books_in_new_lib = {book.id for book in data.libs[new_lib_id].books}
-
-                valid_books = []
-                for book_id in books_to_move:
-                    if book_id not in existing_books_in_new_lib and book_id not in [b for b in valid_books]:
-                        valid_books.append(book_id)
-
-                new_scanned_books_per_library[new_lib_id] = valid_books
-
+                
+            library = data.libs[lib_id]
+            
+            if curr_time + library.signup_days >= data.num_days:
+                continue
+                
+            time_left = data.num_days - (curr_time + library.signup_days)
+            max_books_scanned = time_left * library.books_per_day
+            
+            # Only assign books that actually belong to this library
+            available_books = sorted(
+                [book.id for book in library.books if book.id not in scanned_books],
+                key=lambda b: -data.scores[b]
+            )[:max_books_scanned]
+            
+            if available_books:
+                new_scanned_books_per_library[lib_id] = available_books
+                scanned_books.update(available_books)
+                curr_time += library.signup_days
+        
         new_solution.scanned_books_per_library = new_scanned_books_per_library
+        new_solution.scanned_books = scanned_books
         new_solution.calculate_fitness_score(data.scores)
-
+        
         return new_solution
 
     def tweak_solution_swap_signed(self, solution, data):
@@ -314,71 +346,90 @@ class Solver:
         return new_solution
 
     def tweak_solution_swap_last_book(self, solution, data):
+        """Swap last scanned book with an unscanned book from unsigned libraries."""
         if not solution.scanned_books_per_library or not solution.unsigned_libraries:
-            return solution  # No scanned or unsigned libraries, return unchanged solution
-
+            return solution
+        
         # Pick a random library that has scanned books
-        chosen_lib_id = random.choice(list(solution.scanned_books_per_library.keys()))
+        libraries_with_books = [lib_id for lib_id in solution.scanned_books_per_library.keys() 
+                            if solution.scanned_books_per_library[lib_id]]
+        
+        if not libraries_with_books:
+            return solution
+            
+        chosen_lib_id = random.choice(libraries_with_books)
         scanned_books = solution.scanned_books_per_library[chosen_lib_id]
-
+        
         if not scanned_books:
-            return solution  # Safety check, shouldn't happen
-
+            return solution
+        
         # Get the last scanned book from this library
-        last_scanned_book = scanned_books[-1]  # Last book in the list
-
-        # library_dict = {f"Library {lib.id}": lib for lib in data.libs}
-        library_dict = {lib.id: lib for lib in data.libs}
-
+        last_scanned_book = scanned_books[-1]
+        
+        # Find best unscanned book from ANY library (not just unsigned ones)
         best_book = None
         best_score = -1
-
-        for unsigned_lib in solution.unsigned_libraries:
-            library = library_dict[unsigned_lib]  # O(1) dictionary lookup
-
-            # Find the first unscanned book from this library
+        best_lib_id = None
+        
+        # Check all libraries (both signed and unsigned) for better books
+        for library in data.libs:
+            if library.id >= len(data.libs):
+                continue
+                
             for book in library.books:
-                if book.id not in solution.scanned_books:  # O(1) lookup in set
-                    if data.scores[book.id] > best_score:  # Only store the best
-                        best_book = book.id
-                        best_score = data.scores[book.id]
-                    break  # Stop after the first valid book
-
-        # Assign the best book found (or None if none exist)
-        first_unscanned_book = best_book
-
-        if first_unscanned_book is None:
-            return solution  # No available unscanned books
-
-        # Create new scanned books mapping (deep copy)
+                if (book.id not in solution.scanned_books and 
+                    data.scores[book.id] > data.scores[last_scanned_book] and
+                    data.scores[book.id] > best_score):
+                    
+                    # Check if we can add this book to the library it belongs to
+                    if library.id in solution.signed_libraries:
+                        # Calculate current time when this library starts scanning
+                        lib_index = solution.signed_libraries.index(library.id)
+                        curr_time = sum(data.libs[solution.signed_libraries[i]].signup_days 
+                                    for i in range(lib_index + 1))
+                        
+                        time_left = data.num_days - curr_time
+                        max_books = time_left * library.books_per_day
+                        current_books = len(solution.scanned_books_per_library.get(library.id, []))
+                        
+                        if current_books < max_books:
+                            best_book = book.id
+                            best_score = data.scores[book.id]
+                            best_lib_id = library.id
+        
+        if best_book is None:
+            return solution
+        
+        # Create new solution
         new_scanned_books_per_library = {
             lib_id: books.copy() for lib_id, books in solution.scanned_books_per_library.items()
         }
-
-        # Swap the books
+        
+        # Remove the last book from chosen library
         new_scanned_books_per_library[chosen_lib_id].remove(last_scanned_book)
-        new_scanned_books_per_library[chosen_lib_id].append(first_unscanned_book)
-
-        # Update the overall scanned books set
+        
+        # Add the better book to its correct library
+        if best_lib_id not in new_scanned_books_per_library:
+            new_scanned_books_per_library[best_lib_id] = []
+        new_scanned_books_per_library[best_lib_id].append(best_book)
+        
+        # Update scanned books set
         new_scanned_books = solution.scanned_books.copy()
         new_scanned_books.remove(last_scanned_book)
-        new_scanned_books.add(first_unscanned_book)
-
-        # Create the new solution
+        new_scanned_books.add(best_book)
+        
         new_solution = Solution(
             signed_libs=solution.signed_libraries.copy(),
             unsigned_libs=solution.unsigned_libraries.copy(),
             scanned_books_per_library=new_scanned_books_per_library,
             scanned_books=new_scanned_books
         )
-
-        # Recalculate fitness score
+        
         new_solution.calculate_fitness_score(data.scores)
-
         return new_solution
 
 
-    def iterated_local_search(self, data, time_limit=300, max_iterations=1000):
+    def iterated_local_search(self, data, initial_solution=None, time_limit=300, max_iterations=1000):
         """
         Implements Iterated Local Search (ILS) with Random Restarts
         Args:
@@ -390,7 +441,8 @@ class Solver:
         max_time = min(60, time_limit)
         T = list(range(min_time, max_time + 1, 5))
 
-        S = self.generate_initial_solution_grasp(data, p=0.05, max_time=20)
+        if initial_solution is not None:
+            S = initial_solution
         
         print(f"Initial solution fitness: {S.fitness_score}")
 
@@ -422,7 +474,7 @@ class Solver:
                     S = copy.deepcopy(R)
 
                 if S.fitness_score >= data.calculate_upper_bound():
-                    return (S.fitness_score, S)
+                    return S
 
                 total_iterations += 1
                 if total_iterations >= max_iterations:
@@ -456,8 +508,8 @@ class Solver:
 
             if Best.fitness_score >= data.calculate_upper_bound():
                 break
-
-        return (Best.fitness_score, Best)
+        Best = self.validate_solution_comprehensive(Best, data)
+        return Best
 
     def perturb_solution(self, solution, data):
         """Helper method for ILS to perturb solutions with destroy-and-rebuild strategy"""
@@ -836,14 +888,130 @@ class Solver:
         new_solution.scanned_books_per_library = new_scanned_books_per_library
         new_solution.scanned_books = scanned_books
         new_solution.calculate_fitness_score(data.scores)
+    def hybrid_parallel_evolutionary_search(
+        self,
+        data: InstanceData,
+        initial_solution=None,
+        num_iterations: int = 1000,
+        time_limit: float = None
+    ) -> Tuple[float, Solution]:
+        """
+        Optimized hybrid GA: population-based crossover + parallel hill-climbing mutations,
+        adaptive stagnation, and early stopping.
+        """
+        best_solution   = None
+        best_score      = 0.0
+        start_time      = time.time()
+        stagnation_cnt  = 0
+        max_stagnation  = 50
         
-        return new_solution
+        population_size  = 4
+        tour_size        = 2
+        mutation_prob    = 0.3
+        hill_climb_steps = 50
+
+        # 1) Initialize population
+        if initial_solution is not None:
+            # Use the provided initial solution as the first member of the population
+            population = [initial_solution]
+            # Generate the rest of the population using GRASP
+            while len(population) < population_size:
+                new_solution = self.generate_initial_solution_grasp(data, p=0.05, max_time=5)
+                population.append(new_solution)
+    
+
+        # record initial best
+        for sol in population:
+            if sol.fitness_score > best_score:
+                best_score, best_solution = sol.fitness_score, sol
+
+        # 2) Launch pool once for all generations
+        with ProcessPoolExecutor(
+            max_workers=max(1, population_size // 2),
+            initializer=_pool_init,
+            initargs=(data, hill_climb_steps, mutation_prob)
+        ) as executor:
+
+            iteration = 0
+            while iteration < num_iterations:
+                # time limit?
+                if time_limit and (time.time() - start_time) > time_limit:
+                    break
+
+                # sort & evaluate
+                population.sort(key=lambda s: s.fitness_score, reverse=True)
+                current_best = population[0]
+
+                # update best / stagnation
+                if current_best.fitness_score > best_score:
+                    best_score, best_solution = current_best.fitness_score, current_best
+                    stagnation_cnt = 0
+                else:
+                    stagnation_cnt += 1
+
+                # early stop?
+                if stagnation_cnt >= max_stagnation:
+                    print(f"Early stopping at iteration {iteration} due to no improvement")
+                    break
+
+                # build next generation
+                new_pop = [current_best]  # elitism
+
+                # generate raw offspring
+                raw_offspring = []
+                while len(raw_offspring) < population_size - 1:
+                    p1 = self.tournament_select(population)
+                    p2 = self.tournament_select(population)
+                    o1 = self.crossover(p1, data)
+                    o2 = self.crossover(p2, data)
+                    raw_offspring.append(o1)
+                    if len(raw_offspring) < population_size - 1:
+                        raw_offspring.append(o2)
+
+                # parallel mutation + hill‑climb
+                offspring = list(executor.map(_process_offspring, raw_offspring, chunksize=1))
+
+                new_pop.extend(offspring)
+                population = new_pop
+
+                iteration += 1
+                if iteration % 50 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"Iteration {iteration}, Best Score: {best_score:,}, Time: {elapsed:.1f}s")
+
+        # final fallback
+        # Validate the final solution before returning
+        if best_solution is not None:
+            best_solution = self.validate_solution_comprehensive(best_solution, data)
+            best_score = best_solution.fitness_score
+        else:
+            # Final fallback - should rarely happen
+            print("Warning: No best solution found, using initial solution")
+            best_solution = self.validate_solution_comprehensive(initial_solution, data)
+            best_score = best_solution.fitness_score
+
+        elapsed_time = time.time() - start_time
+        print(f"GA completed in {elapsed_time:.2f}s with best score: {best_score:,}")
+        
+        return best_score, best_solution
+    def initialize_population(self, initializer, data):
+        """Initialize population using the provided initializer function."""
+        population_size = 4
+        return [initializer(data) for _ in range(population_size)]
+
+    def tournament_select(self, population):
+        """Select a solution using tournament selection."""
+        tournament_size  = 2
+        tournament = random.sample(population, tournament_size)
+        return max(tournament, key=lambda x: x.fitness_score)
     def simulated_annealing_core_mp_optimized(self, initial_solution, data, cooling_func, iterations, shared_best, lock, name):
+        # Validate initial solution
         current_solution = copy.deepcopy(initial_solution)
+        current_solution = self.validate_solution_comprehensive(current_solution, data)
         current_solution.calculate_fitness_score(data.scores)
         best_solution = copy.deepcopy(current_solution)
         current_temp = 1000.0
-        # temp_trace = []  # Collect temperature per iteration
+        
         start_time = time.time()  # Koha e fillimit për kontrollin 10 minutësh
 
         # Operatorët kryesorë
@@ -901,7 +1069,6 @@ class Solver:
 
             # Ftohja e temperaturës
             current_temp = cooling_func(current_temp)
-            # temp_trace.append(current_temp)
             # Sinkronizimi dhe përditësimi i peshave çdo 100 iterime
             if iteration % 100 == 0:
                 with lock:
@@ -918,19 +1085,18 @@ class Solver:
                     for name in operator_names
                 ]
              # Final validation
+        # Final validation
         try:
-            self.validate_solution(best_solution, data)
+            best_solution = self.validate_solution_comprehensive(best_solution, data)
             best_solution.calculate_fitness_score(data.scores)
-        except:
-            print(f"[{name.upper()}] Final solution invalid.")
+        except Exception as e:
+            print(f"[{name.upper()}] Final validation failed: {e}")
             return
         with lock:
             if best_solution.fitness_score > shared_best["score"]:
                 shared_best["score"] = best_solution.fitness_score
                 shared_best["solution"] = best_solution
-            # if "temps" not in shared_best:
-            #      shared_best["temps"] = {}
-            # shared_best["temps"][name] = temp_trace  #  Save trace for plotting
+           
     def simulated_annealing_hybrid_parallel(self, data, max_iterations=500,initial_solution=None):
             #Generate initial solution using GRASP
             if initial_solution is None:
@@ -941,7 +1107,6 @@ class Solver:
             shared_best = manager.dict()
             shared_best["score"] = initial_solution.fitness_score
             shared_best["solution"] = initial_solution
-            # shared_best["temps"] = manager.dict()  #  Shared temp traces
             lock = manager.Lock()
 
             # Launch three paralell processes with different cooling strategies
@@ -965,188 +1130,96 @@ class Solver:
             for p in processes:
                 p.join()
 
-            # Visualize temperature curves
-            # plt.figure(figsize=(10, 6))
-            # # for name, temps in dict(shared_best["temps"]).items():
-            # #     if temps:
-            # #         plt.plot(temps, label=name.upper())
-            # temps_dict = shared_best.get("temps", {})
-
-            # if temps_dict:
-            #     if "exp" in temps_dict:
-            #         plt.plot(temps_dict["exp"], label=r"EXP: $T = T_0 \cdot e^{-\alpha \cdot k}$")
-            #     if "geo" in temps_dict:
-            #         plt.plot(temps_dict["geo"], label=r"GEO: $T = T_0 \cdot \alpha^k$")
-            #     if "lundy" in temps_dict:
-            #         plt.plot(temps_dict["lundy"], label=r"LUNDY: $T = \frac{T}{1 + \beta \cdot T}$")
-            # plt.title("Cooling Schedule Comparison")
-            # plt.xlabel("Iteration")
-            # plt.ylabel("Temperature")
-            # plt.grid(True)
-            # plt.legend()
-            # plt.tight_layout()
-            # # plt.savefig("output/cooling_schedules_comparison.png")
-            # plt.show()
-            # plt.close()
             return shared_best["score"], shared_best["solution"]
-    # def validate_solution(self, solution, data):
-    #     # Validates and corrects a solution by removing excess books from libraries that exceed scanning limits.
-    #     id_map = {lib.id: lib for lib in data.libs}
-    #     curr_time = 0
-
-    #     # Validate each library in the signed list
-
-    #     for lib_id in list(solution.signed_libraries):
-    #         library = id_map.get(lib_id)
-    #         if library is None:
-    #             continue  # # Skip if ID is invalid
-            
-    #         # Calculate how many books this library can scan within the time limit
-
-    #         if curr_time + library.signup_days >= data.num_days:
-    #             max_books = 0
-    #         else:
-    #             time_left = data.num_days - (curr_time + library.signup_days)
-    #             max_books = time_left * library.books_per_day
-           
-    #         # Get currently planned books
-            
-    #         scanned_list = solution.scanned_books_per_library.get(lib_id, [])
-    #         actual_count = len(scanned_list)
-
-    #         # Remove excess books if over limit
-
-    #         if actual_count > max_books:
-    #             # Remove all books
-    #             if max_books <= 0:
+    def validate_solution_comprehensive(self, solution, data):
+        """Comprehensive validation that fixes all invalid book assignments."""
+        print("🔍 Starting comprehensive solution validation...")
         
-    #                 removed_books = set(scanned_list)
-    #                 solution.scanned_books_per_library.pop(lib_id, None)
-    #             else:
-    #                 # Remove lowest-scoring books
-    #                 sorted_books = sorted(scanned_list, key=lambda b: data.scores[b])
-    #                 remove_count = actual_count - max_books
-    #                 removed_books = set(sorted_books[:remove_count])
-    #                 kept_books = [b for b in scanned_list if b not in removed_books]
-    #                 solution.scanned_books_per_library[lib_id] = kept_books
-
-    #             # Remove from global scanned books
-
-    #             solution.scanned_books.difference_update(removed_books)
-             
-    #         # Advance time with registered date of this library
+        # Create library lookup
+        lib_lookup = {lib.id: lib for lib in data.libs}
+        
+        # Track all issues found
+        issues_found = []
+        books_to_remove = set()
+        
+        # Validate each library's book assignments
+        for lib_id, book_list in solution.scanned_books_per_library.items():
+            if lib_id not in lib_lookup:
+                issues_found.append(f"Library {lib_id} does not exist")
+                books_to_remove.update(book_list)
+                continue
+                
+            library = lib_lookup[lib_id]
+            valid_book_ids = {book.id for book in library.books}
             
-    #         curr_time += library.signup_days
-    #     return solution
-    # def cpp_style_improvement(self, solution, data, iterations=500):
-    #     import random
-    #     from copy import deepcopy
-
-    #     new_solution = deepcopy(solution)
-
-    #     book_used = set()
-    #     for books in new_solution.scanned_books_per_library.values():
-    #         book_used.update(books)
-
-    #     for _ in range(iterations):
-    #         if not new_solution.signed_libraries:
-    #             break
-
-    #         lib_id = random.choice(list(new_solution.signed_libraries))
-    #         books = new_solution.scanned_books_per_library.get(lib_id, [])
-    #         if not books:
-    #             continue
-
-    #         lib = data.libs[lib_id]
-    #         books_sorted = sorted(books, key=lambda b: data.scores[b])
-    #         for b_out in books_sorted:
-    #             #lib.books contains Book objects
-    #             candidates = [b for b in lib.books if b.id not in book_used]
-    #             if not candidates:
-    #                 continue
-    #             b_in = max(candidates, key=lambda b: data.scores[b.id], default=None)
-
-    #             if b_in and data.scores[b_in.id] > data.scores[b_out]:
-    #                 books.remove(b_out)
-    #                 books.append(b_in.id)
-    #                 book_used.remove(b_out)
-    #                 book_used.add(b_in.id)
-    #                 break
-
-    #         new_solution.scanned_books_per_library[lib_id] = books
-
-    #     new_solution.calculate_fitness_score(data.scores)
-    #     return new_solution
-    # def greedy_medium_approach(self, solution, data, iterations=1):
-    #     from copy import deepcopy
-    #     current_solution = deepcopy(solution)
-    #     assigned_books = set(current_solution.scanned_books)
-    #     assigned_libraries = set(current_solution.signed_libraries)
-
-    #     # Rikalkulojmë current_day bazuar në libraritë ekzistuese
-    #     id_map = {lib.id: lib for lib in data.libs}
-    #     curr_time = 0
-    #     for lib_id in current_solution.signed_libraries:
-    #         lib = id_map[lib_id]
-    #         curr_time += lib.signup_days
-    #         if curr_time >= data.num_days:
-    #             break
-
-    #     remaining_libraries = [lib for lib in data.libs if lib.id not in assigned_libraries]
-    #     selected_libraries = [
-    #         (lib_id, current_solution.scanned_books_per_library.get(lib_id, []))
-    #         for lib_id in current_solution.signed_libraries
-    #     ]
-
-    #     while curr_time < data.num_days and remaining_libraries:
-    #         best_lib = None
-    #         best_score = float('-inf')
-    #         best_books = []
-
-    #         for lib in remaining_libraries:
-    #             days_left = data.num_days - curr_time - lib.signup_days
-    #             if days_left <= 0:
-    #                 continue
-
-    #             max_books = days_left * lib.books_per_day
-    #             available_books = [b for b in lib.books if b.id not in assigned_books]
-    #             sorted_books = sorted(available_books, key=lambda b: data.scores[b.id], reverse=True)
-    #             top_books = sorted_books[:max_books]
-    #             score_sum = sum(data.scores[b.id] for b in top_books)
-
-    #             lib_score = score_sum / lib.signup_days if lib.signup_days else score_sum
-
-    #             if lib_score > best_score and top_books:
-    #                 best_score = lib_score
-    #                 best_lib = lib
-    #                 best_books = top_books
-
-    #         if not best_lib:
-    #             break
-
-    #         curr_time += best_lib.signup_days
-    #         if curr_time >= data.num_days:
-    #             break
-
-    #         # Llogarit sasinë reale të librave që mund të skanohen
-    #         days_left = data.num_days - curr_time
-    #         max_books = min(days_left * best_lib.books_per_day, len(best_books))
-    #         final_books = best_books[:max_books]
-
-    #         assigned_books.update(b.id for b in final_books)
-    #         selected_libraries.append((best_lib.id, [b.id for b in final_books]))
-    #         assigned_libraries.add(best_lib.id)
-    #         remaining_libraries = [l for l in remaining_libraries if l.id != best_lib.id]
-
-    #     # Krijimi i zgjidhjes së re
-    #     new_solution = deepcopy(current_solution)
-    #     new_solution.signed_libraries = [lib_id for lib_id, _ in selected_libraries]
-    #     new_solution.scanned_books_per_library = {lib_id: books for lib_id, books in selected_libraries}
-    #     new_solution.scanned_books = set()
-    #     for books in new_solution.scanned_books_per_library.values():
-    #         new_solution.scanned_books.update(books)
-
-    #     new_solution.calculate_fitness_score(data.scores)
-    #     self.validate_solution(new_solution, data)
-
-    #     return new_solution
+            invalid_books = [book_id for book_id in book_list if book_id not in valid_book_ids]
+            
+            if invalid_books:
+                issues_found.append(f"Library {lib_id} contains invalid books: {invalid_books}")
+                books_to_remove.update(invalid_books)
+        
+        # Remove all invalid books
+        if books_to_remove:
+            print(f"Found {len(books_to_remove)} invalid book assignments")
+            
+            # Clean up scanned_books_per_library
+            for lib_id in list(solution.scanned_books_per_library.keys()):
+                original_books = solution.scanned_books_per_library[lib_id]
+                valid_books = [book_id for book_id in original_books if book_id not in books_to_remove]
+                
+                if valid_books:
+                    solution.scanned_books_per_library[lib_id] = valid_books
+                else:
+                    del solution.scanned_books_per_library[lib_id]
+            
+            # Clean up global scanned_books set
+            solution.scanned_books = solution.scanned_books - books_to_remove
+        
+        # Recalculate to ensure time constraints are met
+        curr_time = 0
+        final_scanned_books = set()
+        final_scanned_books_per_library = {}
+        
+        for lib_id in solution.signed_libraries:
+            if lib_id not in lib_lookup:
+                continue
+                
+            library = lib_lookup[lib_id]
+            
+            if curr_time + library.signup_days >= data.num_days:
+                break
+                
+            time_left = data.num_days - (curr_time + library.signup_days)
+            max_books_scanned = time_left * library.books_per_day
+            
+            # Get books that were assigned to this library
+            assigned_books = solution.scanned_books_per_library.get(lib_id, [])
+            
+            # Validate and limit books
+            valid_books = []
+            for book_id in assigned_books:
+                if (book_id not in final_scanned_books and 
+                    len(valid_books) < max_books_scanned):
+                    valid_books.append(book_id)
+            
+            if valid_books:
+                final_scanned_books_per_library[lib_id] = valid_books
+                final_scanned_books.update(valid_books)
+                curr_time += library.signup_days
+        
+        # Update solution with validated data
+        solution.scanned_books_per_library = final_scanned_books_per_library
+        solution.scanned_books = final_scanned_books
+        solution.calculate_fitness_score(data.scores)
+        
+        if issues_found:
+            print(f"🔧 Fixed {len(issues_found)} validation issues")
+            for issue in issues_found[:5]:  # Show first 5 issues
+                print(f"   • {issue}")
+            if len(issues_found) > 5:
+                print(f"   • ... and {len(issues_found) - 5} more issues")
+        else:
+            print("Solution validation passed")
+        
+        return solution
+    
